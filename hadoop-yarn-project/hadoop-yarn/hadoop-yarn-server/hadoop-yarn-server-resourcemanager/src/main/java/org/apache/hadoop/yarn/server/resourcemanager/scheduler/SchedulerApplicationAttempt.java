@@ -671,7 +671,8 @@ public class SchedulerApplicationAttempt implements SchedulableEntity {
   }
   
   public Resource getCurrentConsumption() {
-    return attemptResourceUsage.getUsed();
+    return Resources.add(attemptResourceUsage.getUsed(),
+        attemptOpportunisticResourceUsage.getUsed());
   }
   
   private Container updateContainerAndNMToken(RMContainer rmContainer,
