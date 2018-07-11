@@ -95,8 +95,8 @@ public class DatanodeStateMachine implements Closeable {
      // trick.
     commandDispatcher = CommandDispatcher.newBuilder()
         .addHandler(new CloseContainerCommandHandler())
-        .addHandler(new DeleteBlocksCommandHandler(
-            container.getContainerManager(), conf))
+        .addHandler(new DeleteBlocksCommandHandler(container.getContainerSet(),
+            conf))
         .addHandler(new ReplicateContainerCommandHandler())
         .setConnectionManager(connectionManager)
         .setContainer(container)

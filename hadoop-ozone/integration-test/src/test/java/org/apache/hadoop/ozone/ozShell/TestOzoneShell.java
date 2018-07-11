@@ -38,6 +38,7 @@ import java.util.Random;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import com.google.common.base.Strings;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.hdds.client.ReplicationFactor;
@@ -59,7 +60,7 @@ import org.apache.hadoop.ozone.client.protocol.ClientProtocol;
 import org.apache.hadoop.ozone.client.rest.OzoneException;
 import org.apache.hadoop.ozone.client.rest.RestClient;
 import org.apache.hadoop.ozone.client.rpc.RpcClient;
-import org.apache.hadoop.ozone.ksm.helpers.ServiceInfo;
+import org.apache.hadoop.ozone.om.helpers.ServiceInfo;
 import org.apache.hadoop.ozone.web.ozShell.Shell;
 import org.apache.hadoop.ozone.web.request.OzoneQuota;
 import org.apache.hadoop.ozone.web.response.BucketInfo;
@@ -167,23 +168,23 @@ public class TestOzoneShell {
     System.setOut(new PrintStream(out));
     System.setErr(new PrintStream(err));
     if(clientProtocol.equals(RestClient.class)) {
-      String hostName = cluster.getKeySpaceManager().getHttpServer()
+      String hostName = cluster.getOzoneManager().getHttpServer()
           .getHttpAddress().getHostName();
       int port = cluster
-          .getKeySpaceManager().getHttpServer().getHttpAddress().getPort();
+          .getOzoneManager().getHttpServer().getHttpAddress().getPort();
       url = String.format("http://" + hostName + ":" + port);
     } else {
       List<ServiceInfo> services = null;
       try {
-        services = cluster.getKeySpaceManager().getServiceList();
+        services = cluster.getOzoneManager().getServiceList();
       } catch (IOException e) {
-        LOG.error("Could not get service list from KSM");
+        LOG.error("Could not get service list from OM");
       }
       String hostName = services.stream().filter(
-          a -> a.getNodeType().equals(HddsProtos.NodeType.KSM))
+          a -> a.getNodeType().equals(HddsProtos.NodeType.OM))
           .collect(Collectors.toList()).get(0).getHostname();
 
-      String port = cluster.getKeySpaceManager().getRpcPort();
+      String port = cluster.getOzoneManager().getRpcPort();
       url = String.format("o3://" + hostName + ":" + port);
     }
   }
@@ -203,13 +204,32 @@ public class TestOzoneShell {
   public void testCreateVolume() throws Exception {
     LOG.info("Running testCreateVolume");
     String volumeName = "volume" + RandomStringUtils.randomNumeric(5);
+    testCreateVolume(volumeName, "");
+    volumeName = "volume" + RandomStringUtils.randomNumeric(5);
+    testCreateVolume("/////" + volumeName, "");
+    testCreateVolume("/////", "Volume name is required to create a volume");
+    testCreateVolume("/////vol/123",
+        "Illegal argument: Bucket or Volume name has an unsupported character : /");
+  }
+
+  private void testCreateVolume(String volumeName, String errorMsg) throws Exception {
+    err.reset();
     String userName = "bilbo";
     String[] args = new String[] {"-createVolume", url + "/" + volumeName,
         "-user", userName, "-root"};
 
-    assertEquals(0, ToolRunner.run(shell, args));
-    OzoneVolume volumeInfo = client.getVolumeDetails(volumeName);
-    assertEquals(volumeName, volumeInfo.getName());
+    if (Strings.isNullOrEmpty(errorMsg)) {
+      assertEquals(0, ToolRunner.run(shell, args));
+    } else {
+      assertEquals(1, ToolRunner.run(shell, args));
+      assertTrue(err.toString().contains(errorMsg));
+      return;
+    }
+
+    String truncatedVolumeName =
+        volumeName.substring(volumeName.lastIndexOf('/') + 1);
+    OzoneVolume volumeInfo = client.getVolumeDetails(truncatedVolumeName);
+    assertEquals(truncatedVolumeName, volumeInfo.getName());
     assertEquals(userName, volumeInfo.getOwner());
   }
 
