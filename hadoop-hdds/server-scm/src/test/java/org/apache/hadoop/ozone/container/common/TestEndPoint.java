@@ -16,18 +16,31 @@
  */
 package org.apache.hadoop.ozone.container.common;
 
-import org.apache.commons.codec.digest.DigestUtils;
-import org.apache.commons.lang3.RandomUtils;
+import java.util.List;
+import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.hdds.HddsConfigKeys;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationType;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
-import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.CloseContainerCommandProto;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.CommandStatus.Status;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.DeleteBlocksCommandProto;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.DeletedBlocksTransaction;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.ReplicateContainerCommandProto;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.SCMCommandProto;
+import org.apache.hadoop.hdds.protocol.proto.
+    StorageContainerDatanodeProtocolProtos.SCMCommandProto.Type;
 import org.apache.hadoop.hdds.scm.TestUtils;
 import org.apache.hadoop.hdds.scm.VersionInfo;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
-import org.apache.hadoop.hdds.protocol.proto
-    .StorageContainerDatanodeProtocolProtos.ContainerReportsProto;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.SCMHeartbeatRequestProto;
 import org.apache.hadoop.hdds.protocol.proto
@@ -38,10 +51,9 @@ import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.StorageReportProto;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.SCMVersionResponseProto;
+import org.apache.hadoop.hdds.scm.container.common.helpers.PipelineID;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
-import org.apache.hadoop.ozone.OzoneConsts;
-import org.apache.hadoop.ozone.container.common.helpers.ContainerReport;
 import org.apache.hadoop.ozone.container.common.statemachine
     .DatanodeStateMachine;
 import org.apache.hadoop.ozone.container.common.statemachine
@@ -53,7 +65,10 @@ import org.apache.hadoop.ozone.container.common.states.endpoint
     .RegisterEndpointTask;
 import org.apache.hadoop.ozone.container.common.states.endpoint
     .VersionEndpointTask;
+import org.apache.hadoop.ozone.container.common.volume.HddsVolume;
 import org.apache.hadoop.ozone.container.ozoneimpl.OzoneContainer;
+import org.apache.hadoop.ozone.protocol.commands.CommandStatus;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.test.PathUtils;
 import org.apache.hadoop.util.Time;
 import org.junit.AfterClass;
@@ -64,16 +79,17 @@ import static org.mockito.Mockito.mock;
 
 import java.io.File;
 import java.net.InetSocketAddress;
-import java.util.List;
 import java.util.UUID;
 
-import static org.apache.hadoop.hdds.scm.TestUtils.getDatanodeDetails;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY;
 import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_METADATA_DIRS;
 import static org.apache.hadoop.ozone.container.common.ContainerTestUtils
     .createEndpoint;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.mockito.Mockito.when;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 
 /**
  * Tests the endpoints.
@@ -83,6 +99,7 @@ public class TestEndPoint {
   private static RPC.Server scmServer;
   private static ScmTestMock scmServerImpl;
   private static File testDir;
+  private static Configuration config;
 
   @AfterClass
   public static void tearDown() throws Exception {
@@ -99,6 +116,12 @@ public class TestEndPoint {
     scmServer = SCMTestUtils.startScmRpcServer(SCMTestUtils.getConf(),
         scmServerImpl, serverAddress, 10);
     testDir = PathUtils.getTestDir(TestEndPoint.class);
+    config = SCMTestUtils.getConf();
+    config.set(DFS_DATANODE_DATA_DIR_KEY, testDir.getAbsolutePath());
+    config.set(OZONE_METADATA_DIRS, testDir.getAbsolutePath());
+    config
+        .setBoolean(OzoneConfigKeys.DFS_CONTAINER_RATIS_IPC_RANDOM_PORT, true);
+    config.set(HddsConfigKeys.HDDS_COMMAND_STATUS_REPORT_INTERVAL,"1s");
   }
 
   @Test
@@ -129,8 +152,8 @@ public class TestEndPoint {
     OzoneConfiguration conf = SCMTestUtils.getConf();
     try (EndpointStateMachine rpcEndPoint = createEndpoint(conf,
         serverAddress, 1000)) {
-      OzoneContainer ozoneContainer = new OzoneContainer(getDatanodeDetails(),
-          conf);
+      OzoneContainer ozoneContainer = new OzoneContainer(
+          TestUtils.randomDatanodeDetails(), conf, null);
       rpcEndPoint.setState(EndpointStateMachine.EndPointStates.GETVERSION);
       VersionEndpointTask versionTask = new VersionEndpointTask(rpcEndPoint,
           conf, ozoneContainer);
@@ -147,6 +170,53 @@ public class TestEndPoint {
   }
 
   @Test
+  public void testCheckVersionResponse() throws Exception {
+    OzoneConfiguration conf = SCMTestUtils.getConf();
+    try (EndpointStateMachine rpcEndPoint = createEndpoint(conf,
+        serverAddress, 1000)) {
+      GenericTestUtils.LogCapturer logCapturer = GenericTestUtils.LogCapturer
+          .captureLogs(VersionEndpointTask.LOG);
+      OzoneContainer ozoneContainer = new OzoneContainer(TestUtils
+          .randomDatanodeDetails(), conf, null);
+      rpcEndPoint.setState(EndpointStateMachine.EndPointStates.GETVERSION);
+      VersionEndpointTask versionTask = new VersionEndpointTask(rpcEndPoint,
+          conf, ozoneContainer);
+      EndpointStateMachine.EndPointStates newState = versionTask.call();
+
+      // if version call worked the endpoint should automatically move to the
+      // next state.
+      Assert.assertEquals(EndpointStateMachine.EndPointStates.REGISTER,
+          newState);
+
+      // Now rpcEndpoint should remember the version it got from SCM
+      Assert.assertNotNull(rpcEndPoint.getVersion());
+
+      // Now change server scmId, so datanode scmId  will be
+      // different from SCM server response scmId
+      String newScmId = UUID.randomUUID().toString();
+      scmServerImpl.setScmId(newScmId);
+      newState = versionTask.call();
+      Assert.assertEquals(EndpointStateMachine.EndPointStates.SHUTDOWN,
+            newState);
+      List<HddsVolume> volumesList = ozoneContainer.getVolumeSet()
+          .getFailedVolumesList();
+      Assert.assertTrue(volumesList.size() == 1);
+      File expectedScmDir = new File(volumesList.get(0).getHddsRootDir(),
+          scmServerImpl.getScmId());
+      Assert.assertTrue(logCapturer.getOutput().contains("expected scm " +
+          "directory " + expectedScmDir.getAbsolutePath() + " does not " +
+          "exist"));
+      Assert.assertTrue(ozoneContainer.getVolumeSet().getVolumesList().size()
+          == 0);
+      Assert.assertTrue(ozoneContainer.getVolumeSet().getFailedVolumesList()
+          .size() == 1);
+
+    }
+  }
+
+
+
+  @Test
   /**
    * This test makes a call to end point where there is no SCM server. We
    * expect that versionTask should be able to handle it.
@@ -158,8 +228,8 @@ public class TestEndPoint {
     try (EndpointStateMachine rpcEndPoint = createEndpoint(conf,
         nonExistentServerAddress, 1000)) {
       rpcEndPoint.setState(EndpointStateMachine.EndPointStates.GETVERSION);
-      OzoneContainer ozoneContainer = new OzoneContainer(getDatanodeDetails(),
-          conf);
+      OzoneContainer ozoneContainer = new OzoneContainer(TestUtils.randomDatanodeDetails(),
+          conf, null);
       VersionEndpointTask versionTask = new VersionEndpointTask(rpcEndPoint,
           conf, ozoneContainer);
       EndpointStateMachine.EndPointStates newState = versionTask.call();
@@ -185,8 +255,8 @@ public class TestEndPoint {
     try (EndpointStateMachine rpcEndPoint = createEndpoint(conf,
         serverAddress, (int) rpcTimeout)) {
       rpcEndPoint.setState(EndpointStateMachine.EndPointStates.GETVERSION);
-      OzoneContainer ozoneContainer = new OzoneContainer(getDatanodeDetails(),
-          conf);
+      OzoneContainer ozoneContainer = new OzoneContainer(
+          TestUtils.randomDatanodeDetails(), conf, null);
       VersionEndpointTask versionTask = new VersionEndpointTask(rpcEndPoint,
           conf, ozoneContainer);
 
@@ -203,14 +273,14 @@ public class TestEndPoint {
 
   @Test
   public void testRegister() throws Exception {
-    DatanodeDetails nodeToRegister = getDatanodeDetails();
+    DatanodeDetails nodeToRegister = TestUtils.randomDatanodeDetails();
     try (EndpointStateMachine rpcEndPoint = createEndpoint(
         SCMTestUtils.getConf(), serverAddress, 1000)) {
       SCMRegisteredResponseProto responseProto = rpcEndPoint.getEndPoint()
           .register(nodeToRegister.getProtoBufMessage(), TestUtils
                   .createNodeReport(
-                      getStorageReports(nodeToRegister.getUuidString())),
-              createContainerReport(10, nodeToRegister));
+                      getStorageReports(nodeToRegister.getUuid())),
+              TestUtils.getRandomContainerReports(10));
       Assert.assertNotNull(responseProto);
       Assert.assertEquals(nodeToRegister.getUuidString(),
           responseProto.getDatanodeUUID());
@@ -221,9 +291,9 @@ public class TestEndPoint {
     }
   }
 
-  private List<StorageReportProto> getStorageReports(String id) {
+  private StorageReportProto getStorageReports(UUID id) {
     String storagePath = testDir.getAbsolutePath() + "/" + id;
-    return TestUtils.createStorageReport(100, 10, 90, storagePath, null, id, 1);
+    return TestUtils.createStorageReport(id, storagePath, 100, 10, 90, null);
   }
 
   private EndpointStateMachine registerTaskHelper(InetSocketAddress scmAddress,
@@ -235,13 +305,13 @@ public class TestEndPoint {
     rpcEndPoint.setState(EndpointStateMachine.EndPointStates.REGISTER);
     OzoneContainer ozoneContainer = mock(OzoneContainer.class);
     when(ozoneContainer.getNodeReport()).thenReturn(TestUtils
-        .createNodeReport(getStorageReports(UUID.randomUUID().toString())));
+        .createNodeReport(getStorageReports(UUID.randomUUID())));
     when(ozoneContainer.getContainerReport()).thenReturn(
-        createContainerReport(10, null));
+        TestUtils.getRandomContainerReports(10));
     RegisterEndpointTask endpointTask =
         new RegisterEndpointTask(rpcEndPoint, conf, ozoneContainer);
     if (!clearDatanodeDetails) {
-      DatanodeDetails datanodeDetails = TestUtils.getDatanodeDetails();
+      DatanodeDetails datanodeDetails = TestUtils.randomDatanodeDetails();
       endpointTask.setDatanodeDetails(datanodeDetails);
     }
     endpointTask.call();
@@ -294,15 +364,14 @@ public class TestEndPoint {
 
   @Test
   public void testHeartbeat() throws Exception {
-    DatanodeDetails dataNode = getDatanodeDetails();
+    DatanodeDetails dataNode = TestUtils.randomDatanodeDetails();
     try (EndpointStateMachine rpcEndPoint =
              createEndpoint(SCMTestUtils.getConf(),
                  serverAddress, 1000)) {
-      String storageId = UUID.randomUUID().toString();
       SCMHeartbeatRequestProto request = SCMHeartbeatRequestProto.newBuilder()
           .setDatanodeDetails(dataNode.getProtoBufMessage())
           .setNodeReport(TestUtils.createNodeReport(
-              getStorageReports(storageId)))
+              getStorageReports(UUID.randomUUID())))
           .build();
 
       SCMHeartbeatResponseProto responseProto = rpcEndPoint.getEndPoint()
@@ -312,7 +381,87 @@ public class TestEndPoint {
     }
   }
 
-  private void heartbeatTaskHelper(InetSocketAddress scmAddress,
+  @Test
+  public void testHeartbeatWithCommandStatusReport() throws Exception {
+    DatanodeDetails dataNode = TestUtils.randomDatanodeDetails();
+    try (EndpointStateMachine rpcEndPoint =
+        createEndpoint(SCMTestUtils.getConf(),
+            serverAddress, 1000)) {
+      // Add some scmCommands for heartbeat response
+      addScmCommands();
+
+
+      SCMHeartbeatRequestProto request = SCMHeartbeatRequestProto.newBuilder()
+          .setDatanodeDetails(dataNode.getProtoBufMessage())
+          .setNodeReport(TestUtils.createNodeReport(
+              getStorageReports(UUID.randomUUID())))
+          .build();
+
+      SCMHeartbeatResponseProto responseProto = rpcEndPoint.getEndPoint()
+          .sendHeartbeat(request);
+      assertNotNull(responseProto);
+      assertEquals(3, responseProto.getCommandsCount());
+      assertEquals(0, scmServerImpl.getCommandStatusReportCount());
+
+      // Send heartbeat again from heartbeat endpoint task
+      final StateContext stateContext = heartbeatTaskHelper(serverAddress, 3000);
+      Map<Long, CommandStatus> map = stateContext.getCommandStatusMap();
+      assertNotNull(map);
+      assertEquals("Should have 3 objects", 3, map.size());
+      assertTrue(map.containsKey(Long.valueOf(1)));
+      assertTrue(map.containsKey(Long.valueOf(2)));
+      assertTrue(map.containsKey(Long.valueOf(3)));
+      assertTrue(map.get(Long.valueOf(1)).getType()
+          .equals(Type.closeContainerCommand));
+      assertTrue(map.get(Long.valueOf(2)).getType()
+          .equals(Type.replicateContainerCommand));
+      assertTrue(
+          map.get(Long.valueOf(3)).getType().equals(Type.deleteBlocksCommand));
+      assertTrue(map.get(Long.valueOf(1)).getStatus().equals(Status.PENDING));
+      assertTrue(map.get(Long.valueOf(2)).getStatus().equals(Status.PENDING));
+      assertTrue(map.get(Long.valueOf(3)).getStatus().equals(Status.PENDING));
+
+      scmServerImpl.clearScmCommandRequests();
+    }
+  }
+
+  private void addScmCommands() {
+    SCMCommandProto closeCommand = SCMCommandProto.newBuilder()
+        .setCloseContainerCommandProto(
+            CloseContainerCommandProto.newBuilder().setCmdId(1)
+        .setContainerID(1)
+        .setReplicationType(ReplicationType.RATIS)
+        .setPipelineID(PipelineID.randomId().getProtobuf())
+        .build())
+        .setCommandType(Type.closeContainerCommand)
+        .build();
+    SCMCommandProto replicationCommand = SCMCommandProto.newBuilder()
+        .setReplicateContainerCommandProto(
+            ReplicateContainerCommandProto.newBuilder()
+        .setCmdId(2)
+        .setContainerID(2)
+        .build())
+        .setCommandType(Type.replicateContainerCommand)
+        .build();
+    SCMCommandProto deleteBlockCommand = SCMCommandProto.newBuilder()
+        .setDeleteBlocksCommandProto(
+            DeleteBlocksCommandProto.newBuilder()
+                .setCmdId(3)
+                .addDeletedBlocksTransactions(
+                    DeletedBlocksTransaction.newBuilder()
+                        .setContainerID(45)
+                        .setCount(1)
+                        .setTxID(23)
+                        .build())
+                .build())
+        .setCommandType(Type.deleteBlocksCommand)
+        .build();
+    scmServerImpl.addScmCommandRequest(closeCommand);
+    scmServerImpl.addScmCommandRequest(deleteBlockCommand);
+    scmServerImpl.addScmCommandRequest(replicationCommand);
+  }
+
+  private StateContext heartbeatTaskHelper(InetSocketAddress scmAddress,
       int rpcTimeout) throws Exception {
     Configuration conf = SCMTestUtils.getConf();
     conf.set(DFS_DATANODE_DATA_DIR_KEY, testDir.getAbsolutePath());
@@ -325,11 +474,11 @@ public class TestEndPoint {
 
     // Create a datanode state machine for stateConext used by endpoint task
     try (DatanodeStateMachine stateMachine = new DatanodeStateMachine(
-        TestUtils.getDatanodeDetails(), conf);
-        EndpointStateMachine rpcEndPoint =
+        TestUtils.randomDatanodeDetails(), conf);
+         EndpointStateMachine rpcEndPoint =
             createEndpoint(conf, scmAddress, rpcTimeout)) {
       HddsProtos.DatanodeDetailsProto datanodeDetailsProto =
-          getDatanodeDetails().getProtoBufMessage();
+          TestUtils.randomDatanodeDetails().getProtoBufMessage();
       rpcEndPoint.setState(EndpointStateMachine.EndPointStates.HEARTBEAT);
 
       final StateContext stateContext =
@@ -344,6 +493,7 @@ public class TestEndPoint {
 
       Assert.assertEquals(EndpointStateMachine.EndPointStates.HEARTBEAT,
           rpcEndPoint.getState());
+      return stateContext;
     }
   }
 
@@ -370,28 +520,6 @@ public class TestEndPoint {
     scmServerImpl.setRpcResponseDelay(0);
     Assert.assertThat(end - start,
         lessThanOrEqualTo(rpcTimeout + tolerance));
-  }
-
-  private ContainerReportsProto createContainerReport(
-      int count, DatanodeDetails datanodeDetails) {
-    StorageContainerDatanodeProtocolProtos.ContainerReportsProto.Builder
-        reportsBuilder = StorageContainerDatanodeProtocolProtos
-        .ContainerReportsProto.newBuilder();
-    for (int x = 0; x < count; x++) {
-      long containerID = RandomUtils.nextLong();
-      ContainerReport report = new ContainerReport(containerID,
-            DigestUtils.sha256Hex("Simulated"));
-      report.setKeyCount(1000);
-      report.setSize(OzoneConsts.GB * 5);
-      report.setBytesUsed(OzoneConsts.GB * 2);
-      report.setReadCount(100);
-      report.setReadBytes(OzoneConsts.GB * 1);
-      report.setWriteCount(50);
-      report.setWriteBytes(OzoneConsts.GB * 2);
-
-      reportsBuilder.addReports(report.getProtoBufMessage());
-    }
-    return reportsBuilder.build();
   }
 
 }

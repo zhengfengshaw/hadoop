@@ -20,11 +20,14 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.scm.container.Mapping;
+import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.node.NodeManager;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeState;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.DeletedBlocksTransaction;
+import org.apache.hadoop.hdds.server.events.EventPublisher;
+import org.apache.hadoop.ozone.protocol.commands.CommandForDatanode;
 import org.apache.hadoop.ozone.protocol.commands.DeleteBlocksCommand;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.utils.BackgroundService;
@@ -36,6 +39,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -53,7 +57,7 @@ import static org.apache.hadoop.ozone.OzoneConfigKeys
  */
 public class SCMBlockDeletingService extends BackgroundService {
 
-  static final Logger LOG =
+  public static final Logger LOG =
       LoggerFactory.getLogger(SCMBlockDeletingService.class);
 
   // ThreadPoolSize=2, 1 for scheduler and the other for the scanner.
@@ -61,6 +65,7 @@ public class SCMBlockDeletingService extends BackgroundService {
   private final DeletedBlockLog deletedBlockLog;
   private final Mapping mappingService;
   private final NodeManager nodeManager;
+  private final EventPublisher eventPublisher;
 
   // Block delete limit size is dynamically calculated based on container
   // delete limit size (ozone.block.deleting.container.limit.per.interval)
@@ -76,13 +81,14 @@ public class SCMBlockDeletingService extends BackgroundService {
   private int blockDeleteLimitSize;
 
   public SCMBlockDeletingService(DeletedBlockLog deletedBlockLog,
-      Mapping mapper, NodeManager nodeManager,
-      long  interval, long serviceTimeout, Configuration conf) {
+      Mapping mapper, NodeManager nodeManager, EventPublisher eventPublisher,
+      long interval, long serviceTimeout, Configuration conf) {
     super("SCMBlockDeletingService", interval, TimeUnit.MILLISECONDS,
         BLOCK_DELETING_SERVICE_CORE_POOL_SIZE, serviceTimeout);
     this.deletedBlockLog = deletedBlockLog;
     this.mappingService = mapper;
     this.nodeManager = nodeManager;
+    this.eventPublisher = eventPublisher;
 
     int containerLimit = conf.getInt(
         OZONE_BLOCK_DELETING_CONTAINER_LIMIT_PER_INTERVAL,
@@ -99,6 +105,19 @@ public class SCMBlockDeletingService extends BackgroundService {
     BackgroundTaskQueue queue = new BackgroundTaskQueue();
     queue.add(new DeletedBlockTransactionScanner());
     return queue;
+  }
+
+  public void handlePendingDeletes(PendingDeleteStatusList deletionStatusList) {
+    DatanodeDetails dnDetails = deletionStatusList.getDatanodeDetails();
+    for (PendingDeleteStatusList.PendingDeleteStatus deletionStatus : deletionStatusList
+        .getPendingDeleteStatuses()) {
+      LOG.info(
+          "Block deletion txnID mismatch in datanode {} for containerID {}."
+              + " Datanode delete txnID: {}, SCM txnID: {}",
+          dnDetails.getUuid(), deletionStatus.getContainerId(),
+          deletionStatus.getDnDeleteTransactionId(),
+          deletionStatus.getScmDeleteTransactionId());
+    }
   }
 
   private class DeletedBlockTransactionScanner
@@ -118,11 +137,12 @@ public class SCMBlockDeletingService extends BackgroundService {
       LOG.debug("Running DeletedBlockTransactionScanner");
       DatanodeDeletedBlockTransactions transactions = null;
       List<DatanodeDetails> datanodes = nodeManager.getNodes(NodeState.HEALTHY);
+      Map<Long, Long> transactionMap = null;
       if (datanodes != null) {
         transactions = new DatanodeDeletedBlockTransactions(mappingService,
             blockDeleteLimitSize, datanodes.size());
         try {
-          deletedBlockLog.getTransactions(transactions);
+          transactionMap = deletedBlockLog.getTransactions(transactions);
         } catch (IOException e) {
           // We may tolerant a number of failures for sometime
           // but if it continues to fail, at some point we need to raise
@@ -145,8 +165,8 @@ public class SCMBlockDeletingService extends BackgroundService {
             // We should stop caching new commands if num of un-processed
             // command is bigger than a limit, e.g 50. In case datanode goes
             // offline for sometime, the cached commands be flooded.
-            nodeManager.addDatanodeCommand(dnId,
-                new DeleteBlocksCommand(dnTXs));
+            eventPublisher.fireEvent(SCMEvents.DATANODE_COMMAND,
+                new CommandForDatanode<>(dnId, new DeleteBlocksCommand(dnTXs)));
             LOG.debug(
                 "Added delete block command for datanode {} in the queue,"
                     + " number of delete block transactions: {}, TxID list: {}",
@@ -154,6 +174,7 @@ public class SCMBlockDeletingService extends BackgroundService {
                     transactions.getTransactionIDList(dnId)));
           }
         }
+        mappingService.updateDeleteTransactionId(transactionMap);
       }
 
       if (dnTxCount > 0) {

@@ -35,6 +35,7 @@ import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+import org.apache.hadoop.ozone.OzoneTestUtils;
 import org.apache.hadoop.ozone.client.BucketArgs;
 import org.apache.hadoop.ozone.client.VolumeArgs;
 import org.apache.hadoop.ozone.client.OzoneBucket;
@@ -67,7 +68,6 @@ import org.apache.log4j.Logger;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
@@ -663,7 +663,6 @@ public class TestKeys {
   }
 
   @Test
-  @Ignore("Needs to be fixed for new SCM and Storage design")
   public void testDeleteKey() throws Exception {
     OzoneManager ozoneManager = ozoneCluster.getOzoneManager();
     // To avoid interference from other test cases,
@@ -700,6 +699,8 @@ public class TestKeys {
       for (OmKeyInfo keyInfo : createdKeys) {
         List<OmKeyLocationInfo> locations =
             keyInfo.getLatestVersionLocations().getLocationList();
+        OzoneTestUtils.closeContainers(keyInfo.getKeyLocationVersions(),
+            ozoneCluster.getStorageContainerManager());
         for (OmKeyLocationInfo location : locations) {
           KeyValueHandler  keyValueHandler = (KeyValueHandler) cm
               .getDispatcher().getHandler(ContainerProtos.ContainerType

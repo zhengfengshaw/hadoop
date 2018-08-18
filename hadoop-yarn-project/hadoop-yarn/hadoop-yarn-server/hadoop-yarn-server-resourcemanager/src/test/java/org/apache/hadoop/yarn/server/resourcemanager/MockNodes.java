@@ -286,6 +286,11 @@ public class MockNodes {
     }
 
     @Override
+    public RMContext getRMContext() {
+      return null;
+    }
+
+    @Override
     public Resource getPhysicalResource() {
       return this.physicalResource;
     }
@@ -342,17 +347,17 @@ public class MockNodes {
   }
 
   public static RMNode newNodeInfo(int rack, final Resource perNode, int hostnum) {
-    return buildRMNode(rack, perNode, null, "localhost:0", hostnum, null, 123);
+    return buildRMNode(rack, perNode, NodeState.RUNNING, "localhost:0", hostnum, null, 123);
   }
   
   public static RMNode newNodeInfo(int rack, final Resource perNode,
       int hostnum, String hostName) {
-    return buildRMNode(rack, perNode, null, "localhost:0", hostnum, hostName, 123);
+    return buildRMNode(rack, perNode, NodeState.RUNNING, "localhost:0", hostnum, hostName, 123);
   }
 
   public static RMNode newNodeInfo(int rack, final Resource perNode,
       int hostnum, String hostName, int port) {
-    return buildRMNode(rack, perNode, null, "localhost:0", hostnum, hostName, port);
+    return buildRMNode(rack, perNode, NodeState.RUNNING, "localhost:0", hostnum, hostName, port);
   }
 
 }

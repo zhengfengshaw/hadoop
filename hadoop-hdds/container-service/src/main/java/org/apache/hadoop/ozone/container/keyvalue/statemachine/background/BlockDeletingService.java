@@ -19,10 +19,14 @@
 package org.apache.hadoop.ozone.container.keyvalue.statemachine.background;
 
 import com.google.common.collect.Lists;
+import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.ozone.container.common.impl.ContainerData;
 import org.apache.hadoop.ozone.container.common.impl.ContainerSet;
+import org.apache.hadoop.ozone.container.common.impl.TopNOrderedContainerDeletionChoosingPolicy;
+import org.apache.hadoop.ozone.container.common.interfaces.ContainerDeletionChoosingPolicy;
 import org.apache.hadoop.ozone.container.keyvalue.KeyValueContainerData;
 import org.apache.hadoop.ozone.container.keyvalue.helpers.KeyUtils;
+import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.ratis.shaded.com.google.protobuf
     .InvalidProtocolBufferException;
 import org.apache.commons.io.FileUtils;
@@ -69,6 +73,7 @@ public class BlockDeletingService extends BackgroundService{
       LoggerFactory.getLogger(BlockDeletingService.class);
 
   ContainerSet containerSet;
+  private ContainerDeletionChoosingPolicy containerDeletionPolicy;
   private final Configuration conf;
 
   // Throttle number of blocks to delete per task,
@@ -83,12 +88,15 @@ public class BlockDeletingService extends BackgroundService{
   // Core pool size for container tasks
   private final static int BLOCK_DELETING_SERVICE_CORE_POOL_SIZE = 10;
 
-  public BlockDeletingService(ContainerSet containerSet,
-      long serviceInterval, long serviceTimeout, Configuration conf) {
-    super("BlockDeletingService", serviceInterval,
-        TimeUnit.MILLISECONDS, BLOCK_DELETING_SERVICE_CORE_POOL_SIZE,
-        serviceTimeout);
+  public BlockDeletingService(ContainerSet containerSet, long serviceInterval,
+      long serviceTimeout, TimeUnit timeUnit, Configuration conf) {
+    super("BlockDeletingService", serviceInterval, timeUnit,
+        BLOCK_DELETING_SERVICE_CORE_POOL_SIZE, serviceTimeout);
     this.containerSet = containerSet;
+    containerDeletionPolicy = ReflectionUtils.newInstance(conf.getClass(
+        ScmConfigKeys.OZONE_SCM_KEY_VALUE_CONTAINER_DELETION_CHOOSING_POLICY,
+        TopNOrderedContainerDeletionChoosingPolicy.class,
+        ContainerDeletionChoosingPolicy.class), conf);
     this.conf = conf;
     this.blockLimitPerTask = conf.getInt(
         OZONE_BLOCK_DELETING_LIMIT_PER_CONTAINER,
@@ -110,10 +118,12 @@ public class BlockDeletingService extends BackgroundService{
       // The chosen result depends on what container deletion policy is
       // configured.
       containers = containerSet.chooseContainerForBlockDeletion(
-          containerLimitPerInterval);
-      LOG.info("Plan to choose {} containers for block deletion, "
-          + "actually returns {} valid containers.",
-          containerLimitPerInterval, containers.size());
+          containerLimitPerInterval, containerDeletionPolicy);
+      if (containers.size() > 0) {
+        LOG.info("Plan to choose {} containers for block deletion, "
+                + "actually returns {} valid containers.",
+            containerLimitPerInterval, containers.size());
+      }
 
       for(ContainerData container : containers) {
         BlockDeletingTask containerTask =
@@ -163,11 +173,11 @@ public class BlockDeletingService extends BackgroundService{
       implements BackgroundTask<BackgroundTaskResult> {
 
     private final int priority;
-    private final ContainerData containerData;
+    private final KeyValueContainerData containerData;
 
     BlockDeletingTask(ContainerData containerName, int priority) {
       this.priority = priority;
-      this.containerData = containerName;
+      this.containerData = (KeyValueContainerData) containerName;
     }
 
     @Override
@@ -190,10 +200,10 @@ public class BlockDeletingService extends BackgroundService{
       List<String> succeedBlocks = new LinkedList<>();
       LOG.debug("Container : {}, To-Delete blocks : {}",
           containerData.getContainerID(), toDeleteBlocks.size());
-      File dataDir = new File(containerData.getDataPath());
+      File dataDir = new File(containerData.getChunksPath());
       if (!dataDir.exists() || !dataDir.isDirectory()) {
         LOG.error("Invalid container data dir {} : "
-            + "not exist or not a directory", dataDir.getAbsolutePath());
+            + "does not exist or not a directory", dataDir.getAbsolutePath());
         return crr;
       }
 

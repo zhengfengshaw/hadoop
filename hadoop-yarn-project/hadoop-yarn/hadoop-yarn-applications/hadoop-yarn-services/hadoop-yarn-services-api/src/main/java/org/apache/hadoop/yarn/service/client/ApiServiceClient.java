@@ -20,19 +20,28 @@ import static org.apache.hadoop.yarn.service.utils.ServiceApiUtil.jsonSerDeser;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.PrivilegedExceptionAction;
 import java.text.MessageFormat;
 import java.util.List;
 import java.util.Map;
 
+import javax.ws.rs.core.HttpHeaders;
 import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.UriBuilder;
 
 import com.google.common.base.Preconditions;
+
+import org.apache.commons.codec.binary.Base64;
+import com.google.common.base.Strings;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.security.authentication.client.AuthenticatedURL;
+import org.apache.hadoop.security.authentication.client.AuthenticationException;
+import org.apache.hadoop.security.authentication.util.KerberosUtil;
 import org.apache.hadoop.yarn.api.ApplicationConstants;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
@@ -48,11 +57,14 @@ import org.apache.hadoop.yarn.service.api.records.Service;
 import org.apache.hadoop.yarn.service.api.records.ServiceState;
 import org.apache.hadoop.yarn.service.api.records.ServiceStatus;
 import org.apache.hadoop.yarn.service.conf.RestApiConstants;
-import org.apache.hadoop.yarn.service.utils.JsonSerDeser;
 import org.apache.hadoop.yarn.service.utils.ServiceApiUtil;
 import org.apache.hadoop.yarn.util.RMHAUtils;
-import org.codehaus.jackson.map.PropertyNamingStrategy;
 import org.eclipse.jetty.util.UrlEncoded;
+import org.ietf.jgss.GSSContext;
+import org.ietf.jgss.GSSException;
+import org.ietf.jgss.GSSManager;
+import org.ietf.jgss.GSSName;
+import org.ietf.jgss.Oid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,6 +83,7 @@ import static org.apache.hadoop.yarn.service.exceptions.LauncherExitCodes.*;
 public class ApiServiceClient extends AppAdminClient {
   private static final Logger LOG =
       LoggerFactory.getLogger(ApiServiceClient.class);
+  private static final Base64 BASE_64_CODEC = new Base64(0);
   protected YarnClient yarnClient;
 
   @Override protected void serviceInit(Configuration configuration)
@@ -78,6 +91,54 @@ public class ApiServiceClient extends AppAdminClient {
     yarnClient = YarnClient.createYarnClient();
     addService(yarnClient);
     super.serviceInit(configuration);
+  }
+
+  /**
+   * Generate SPNEGO challenge request token.
+   *
+   * @param server - hostname to contact
+   * @throws IOException
+   * @throws InterruptedException
+   */
+  String generateToken(String server) throws IOException, InterruptedException {
+    UserGroupInformation currentUser = UserGroupInformation.getCurrentUser();
+    LOG.debug("The user credential is {}", currentUser);
+    String challenge = currentUser
+        .doAs(new PrivilegedExceptionAction<String>() {
+          @Override
+          public String run() throws Exception {
+            try {
+              // This Oid for Kerberos GSS-API mechanism.
+              Oid mechOid = KerberosUtil.getOidInstance("GSS_KRB5_MECH_OID");
+              GSSManager manager = GSSManager.getInstance();
+              // GSS name for server
+              GSSName serverName = manager.createName("HTTP@" + server,
+                  GSSName.NT_HOSTBASED_SERVICE);
+              // Create a GSSContext for authentication with the service.
+              // We're passing client credentials as null since we want them to
+              // be read from the Subject.
+              GSSContext gssContext = manager.createContext(
+                  serverName.canonicalize(mechOid), mechOid, null,
+                  GSSContext.DEFAULT_LIFETIME);
+              gssContext.requestMutualAuth(true);
+              gssContext.requestCredDeleg(true);
+              // Establish context
+              byte[] inToken = new byte[0];
+              byte[] outToken = gssContext.initSecContext(inToken, 0,
+                  inToken.length);
+              gssContext.dispose();
+              // Base64 encoded and stringified token for server
+              LOG.debug("Got valid challenge for host {}", serverName);
+              return new String(BASE_64_CODEC.encode(outToken),
+                  StandardCharsets.US_ASCII);
+            } catch (GSSException | IllegalAccessException
+                | NoSuchFieldException | ClassNotFoundException e) {
+              LOG.error("Error: {}", e);
+              throw new AuthenticationException(e);
+            }
+          }
+        });
+    return challenge;
   }
 
   /**
@@ -100,6 +161,7 @@ public class ApiServiceClient extends AppAdminClient {
     for (String host : rmServers) {
       try {
         Client client = Client.create();
+        client.setFollowRedirects(false);
         StringBuilder sb = new StringBuilder();
         sb.append(scheme);
         sb.append(host);
@@ -116,8 +178,11 @@ public class ApiServiceClient extends AppAdminClient {
         WebResource webResource = client
             .resource(sb.toString());
         if (useKerberos) {
-          AuthenticatedURL.Token token = new AuthenticatedURL.Token();
-          webResource.header("WWW-Authenticate", token);
+          String[] server = host.split(":");
+          String challenge = generateToken(server[0]);
+          webResource.header(HttpHeaders.AUTHORIZATION, "Negotiate " +
+              challenge);
+          LOG.debug("Authorization: Negotiate {}", challenge);
         }
         ClientResponse test = webResource.get(ClientResponse.class);
         if (test.getStatus() == 200) {
@@ -125,7 +190,8 @@ public class ApiServiceClient extends AppAdminClient {
           break;
         }
       } catch (Exception e) {
-        LOG.debug("Fail to connect to: "+host, e);
+        LOG.info("Fail to connect to: "+host);
+        LOG.debug("Root cause: {}", e);
       }
     }
     return scheme+rmAddress;
@@ -147,11 +213,7 @@ public class ApiServiceClient extends AppAdminClient {
       api.append("/");
       api.append(appName);
     }
-    Configuration conf = getConfig();
-    if (conf.get("hadoop.http.authentication.type").equalsIgnoreCase("simple")) {
-      api.append("?user.name=" + UrlEncoded
-          .encodeString(System.getProperty("user.name")));
-    }
+    appendUserNameIfRequired(api);
     return api.toString();
   }
 
@@ -162,13 +224,25 @@ public class ApiServiceClient extends AppAdminClient {
     api.append(url);
     api.append("/app/v1/services/").append(appName).append("/")
         .append(RestApiConstants.COMP_INSTANCES);
-    Configuration conf = getConfig();
-    if (conf.get("hadoop.http.authentication.type").equalsIgnoreCase(
-        "simple")) {
-      api.append("?user.name=" + UrlEncoded
-          .encodeString(System.getProperty("user.name")));
-    }
+    appendUserNameIfRequired(api);
     return api.toString();
+  }
+
+  private String getInstancePath(String appName, List<String> components,
+      String version, List<String> containerStates) throws IOException {
+    UriBuilder builder = UriBuilder.fromUri(getInstancesPath(appName));
+    if (components != null && !components.isEmpty()) {
+      components.forEach(compName ->
+        builder.queryParam(RestApiConstants.PARAM_COMP_NAME, compName));
+    }
+    if (!Strings.isNullOrEmpty(version)){
+      builder.queryParam(RestApiConstants.PARAM_VERSION, version);
+    }
+    if (containerStates != null && !containerStates.isEmpty()){
+      containerStates.forEach(state ->
+          builder.queryParam(RestApiConstants.PARAM_CONTAINER_STATE, state));
+    }
+    return builder.build().toString();
   }
 
   private String getComponentsPath(String appName) throws IOException {
@@ -178,13 +252,17 @@ public class ApiServiceClient extends AppAdminClient {
     api.append(url);
     api.append("/app/v1/services/").append(appName).append("/")
         .append(RestApiConstants.COMPONENTS);
+    appendUserNameIfRequired(api);
+    return api.toString();
+  }
+
+  private void appendUserNameIfRequired(StringBuilder builder) {
     Configuration conf = getConfig();
     if (conf.get("hadoop.http.authentication.type").equalsIgnoreCase(
         "simple")) {
-      api.append("?user.name=" + UrlEncoded
+      builder.append("?user.name=").append(UrlEncoded
           .encodeString(System.getProperty("user.name")));
     }
-    return api.toString();
   }
 
   private Builder getApiClient() throws IOException {
@@ -206,8 +284,13 @@ public class ApiServiceClient extends AppAdminClient {
     Builder builder = client
         .resource(requestPath).type(MediaType.APPLICATION_JSON);
     if (conf.get("hadoop.http.authentication.type").equals("kerberos")) {
-      AuthenticatedURL.Token token = new AuthenticatedURL.Token();
-      builder.header("WWW-Authenticate", token);
+      try {
+        URI url = new URI(requestPath);
+        String challenge = generateToken(url.getHost());
+        builder.header(HttpHeaders.AUTHORIZATION, "Negotiate " + challenge);
+      } catch (Exception e) {
+        throw new IOException(e);
+      }
     }
     return builder
         .accept("application/json;charset=utf-8");
@@ -553,7 +636,7 @@ public class ApiServiceClient extends AppAdminClient {
         container.setState(ContainerState.UPGRADING);
         toUpgrade[idx++] = container;
       }
-      String buffer = CONTAINER_JSON_SERDE.toJson(toUpgrade);
+      String buffer = ServiceApiUtil.CONTAINER_JSON_SERDE.toJson(toUpgrade);
       ClientResponse response = getApiClient(getInstancesPath(appName))
           .put(ClientResponse.class, buffer);
       result = processResponse(response);
@@ -577,7 +660,7 @@ public class ApiServiceClient extends AppAdminClient {
         component.setState(ComponentState.UPGRADING);
         toUpgrade[idx++] = component;
       }
-      String buffer = COMP_JSON_SERDE.toJson(toUpgrade);
+      String buffer = ServiceApiUtil.COMP_JSON_SERDE.toJson(toUpgrade);
       ClientResponse response = getApiClient(getComponentsPath(appName))
           .put(ClientResponse.class, buffer);
       result = processResponse(response);
@@ -599,11 +682,25 @@ public class ApiServiceClient extends AppAdminClient {
     return result;
   }
 
-  private static final JsonSerDeser<Container[]> CONTAINER_JSON_SERDE =
-      new JsonSerDeser<>(Container[].class,
-          PropertyNamingStrategy.CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES);
-
-  private static final JsonSerDeser<Component[]> COMP_JSON_SERDE =
-      new JsonSerDeser<>(Component[].class,
-          PropertyNamingStrategy.CAMEL_CASE_TO_LOWER_CASE_WITH_UNDERSCORES);
+  @Override
+  public String getInstances(String appName, List<String> components,
+      String version, List<String> containerStates) throws IOException,
+      YarnException {
+    try {
+      String uri = getInstancePath(appName, components, version,
+          containerStates);
+      ClientResponse response = getApiClient(uri).get(ClientResponse.class);
+      if (response.getStatus() != 200) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Failed: HTTP error code: ");
+        sb.append(response.getStatus());
+        sb.append(" ErrorMsg: ").append(response.getEntity(String.class));
+        return sb.toString();
+      }
+      return response.getEntity(String.class);
+    } catch (Exception e) {
+      LOG.error("Fail to get containers {}", e);
+    }
+    return null;
+  }
 }

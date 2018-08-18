@@ -76,6 +76,8 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
     Comparable<ComponentInstance> {
   private static final Logger LOG =
       LoggerFactory.getLogger(ComponentInstance.class);
+  private static final String FAILED_BEFORE_LAUNCH_DIAG =
+      "failed before launch";
 
   private  StateMachine<ComponentInstanceState, ComponentInstanceEventType,
       ComponentInstanceEvent> stateMachine;
@@ -97,6 +99,7 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
   private long containerStartedTime = 0;
   // This container object is used for rest API query
   private org.apache.hadoop.yarn.service.api.records.Container containerSpec;
+  private String serviceVersion;
 
 
   private static final StateMachineFactory<ComponentInstance,
@@ -194,6 +197,8 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
       compInstance.getCompSpec().addContainer(container);
       compInstance.containerStartedTime = containerStartTime;
       compInstance.component.incRunningContainers();
+      compInstance.serviceVersion = compInstance.scheduler.getApp()
+          .getVersion();
 
       if (compInstance.timelineServiceEnabled) {
         compInstance.serviceTimelinePublisher
@@ -210,6 +215,8 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
       if (compInstance.getState().equals(ComponentInstanceState.UPGRADING)) {
         compInstance.component.incContainersReady(false);
         compInstance.component.decContainersThatNeedUpgrade();
+        compInstance.serviceVersion = compInstance.component.getUpgradeEvent()
+            .getUpgradeVersion();
         ComponentEvent checkState = new ComponentEvent(
             compInstance.component.getName(), ComponentEventType.CHECK_STABLE);
         compInstance.scheduler.getDispatcher().getEventHandler().handle(
@@ -236,7 +243,8 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
 
   @VisibleForTesting
   static void handleComponentInstanceRelaunch(
-      ComponentInstance compInstance, ComponentInstanceEvent event) {
+      ComponentInstance compInstance, ComponentInstanceEvent event,
+      boolean failureBeforeLaunch) {
     Component comp = compInstance.getComponent();
 
     // Do we need to relaunch the service?
@@ -248,12 +256,20 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
       // re-ask the failed container.
       comp.requestContainers(1);
       comp.reInsertPendingInstance(compInstance);
-      LOG.info(compInstance.getCompInstanceId()
-              + ": {} completed. Reinsert back to pending list and requested " +
-              "a new container." + System.lineSeparator() +
-              " exitStatus={}, diagnostics={}.",
-          event.getContainerId(), event.getStatus().getExitStatus(),
-          event.getStatus().getDiagnostics());
+
+      StringBuilder builder = new StringBuilder();
+      builder.append(compInstance.getCompInstanceId()).append(": ");
+      builder.append(event.getContainerId()).append(" completed. Reinsert back to pending list and requested ");
+      builder.append("a new container.").append(System.lineSeparator());
+      builder.append(" exitStatus=").append(failureBeforeLaunch ? null : event.getStatus().getExitStatus());
+      builder.append(", diagnostics=");
+      builder.append(failureBeforeLaunch ? FAILED_BEFORE_LAUNCH_DIAG : event.getStatus().getDiagnostics());
+
+      if (event.getStatus().getExitStatus() != 0) {
+        LOG.error(builder.toString());
+      } else {
+        LOG.info(builder.toString());
+      }
     } else {
       // When no relaunch, update component's #succeeded/#failed
       // instances.
@@ -292,8 +308,8 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
 
       Component comp = compInstance.component;
       String containerDiag =
-          compInstance.getCompInstanceId() + ": " + event.getStatus()
-              .getDiagnostics();
+          compInstance.getCompInstanceId() + ": " + (failedBeforeLaunching ?
+              FAILED_BEFORE_LAUNCH_DIAG : event.getStatus().getDiagnostics());
       compInstance.diagnostics.append(containerDiag + System.lineSeparator());
       compInstance.cancelContainerStatusRetriever();
       if (compInstance.getState().equals(ComponentInstanceState.UPGRADING)) {
@@ -307,6 +323,9 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
       boolean shouldFailService = false;
 
       final ServiceScheduler scheduler = comp.getScheduler();
+      scheduler.getAmRMClient().releaseAssignedContainer(
+          event.getContainerId());
+
       // Check if it exceeds the failure threshold, but only if health threshold
       // monitor is not enabled
       if (!comp.isHealthThresholdMonitorEnabled()
@@ -347,7 +366,8 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
 
       // According to component restart policy, handle container restart
       // or finish the service (if all components finished)
-      handleComponentInstanceRelaunch(compInstance, event);
+      handleComponentInstanceRelaunch(compInstance, event,
+          failedBeforeLaunching);
 
       if (shouldFailService) {
         scheduler.getTerminationHandler().terminate(-1);
@@ -377,6 +397,30 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
 
     try {
       return this.stateMachine.getCurrentState();
+    } finally {
+      this.readLock.unlock();
+    }
+  }
+
+  /**
+   * Returns the version of service at which the instance is at.
+   */
+  public String getServiceVersion() {
+    this.readLock.lock();
+    try {
+      return this.serviceVersion;
+    } finally {
+      this.readLock.unlock();
+    }
+  }
+
+  /**
+   * Returns the state of the container in the container spec.
+   */
+  public ContainerState getContainerState() {
+    this.readLock.lock();
+    try {
+      return this.containerSpec.getState();
     } finally {
       this.readLock.unlock();
     }
@@ -465,7 +509,7 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
     return this.container.getNodeId();
   }
 
-  public org.apache.hadoop.yarn.service.api.records.Component getCompSpec() {
+  private org.apache.hadoop.yarn.service.api.records.Component getCompSpec() {
     return component.getComponentSpec();
   }
 
@@ -667,8 +711,16 @@ public class ComponentInstance implements EventHandler<ComponentInstanceEvent>,
     return result;
   }
 
-  @VisibleForTesting public org.apache.hadoop.yarn.service.api.records
+  /**
+   * Returns container spec.
+   */
+  public org.apache.hadoop.yarn.service.api.records
       .Container getContainerSpec() {
-    return containerSpec;
+    readLock.lock();
+    try {
+      return containerSpec;
+    } finally {
+      readLock.unlock();
+    }
   }
 }

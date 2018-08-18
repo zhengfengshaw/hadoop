@@ -18,22 +18,34 @@
 
 package org.apache.hadoop.ozone.container.common.volume;
 
+import java.io.IOException;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
-import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.ozone.container.common.utils.HddsVolumeUtil;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.test.GenericTestUtils.LogCapturer;
+
+import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_DATANODE_DIR_KEY;
+import static org.apache.hadoop.ozone.container.common.volume.HddsVolume
+    .HDDS_VOLUME_DIR;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -69,6 +81,31 @@ public class TestVolumeSet {
     initializeVolumeSet();
   }
 
+  @After
+  public void shutdown() throws IOException {
+    // Delete the hdds volume root dir
+    List<HddsVolume> hddsVolumes = new ArrayList<>();
+    hddsVolumes.addAll(volumeSet.getVolumesList());
+    hddsVolumes.addAll(volumeSet.getFailedVolumesList());
+
+    for (HddsVolume volume : hddsVolumes) {
+      FileUtils.deleteDirectory(volume.getHddsRootDir());
+    }
+    volumeSet.shutdown();
+
+    FileUtil.fullyDelete(new File(baseDir));
+  }
+
+  private boolean checkVolumeExistsInVolumeSet(String volume) {
+    for (HddsVolume hddsVolume : volumeSet.getVolumesList()) {
+      if (hddsVolume.getHddsRootDir().getPath().equals(
+          HddsVolumeUtil.getHddsRoot(volume))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   @Test
   public void testVolumeSetInitialization() throws Exception {
 
@@ -84,14 +121,15 @@ public class TestVolumeSet {
   }
 
   @Test
-  public void testAddVolume() throws Exception {
+  public void testAddVolume() {
 
     assertEquals(2, volumeSet.getVolumesList().size());
 
     // Add a volume to VolumeSet
     String volume3 = baseDir + "disk3";
-    volumeSet.addVolume(volume3);
+    boolean success = volumeSet.addVolume(volume3);
 
+    assertTrue(success);
     assertEquals(3, volumeSet.getVolumesList().size());
     assertTrue("AddVolume did not add requested volume to VolumeSet",
         checkVolumeExistsInVolumeSet(volume3));
@@ -122,7 +160,6 @@ public class TestVolumeSet {
   @Test
   public void testRemoveVolume() throws Exception {
 
-    List<HddsVolume> volumesList = volumeSet.getVolumesList();
     assertEquals(2, volumeSet.getVolumesList().size());
 
     // Remove a volume from VolumeSet
@@ -141,13 +178,77 @@ public class TestVolumeSet {
         + expectedLogMessage, logs.getOutput().contains(expectedLogMessage));
   }
 
-  private boolean checkVolumeExistsInVolumeSet(String volume) {
-    for (HddsVolume hddsVolume : volumeSet.getVolumesList()) {
-      if (hddsVolume.getHddsRootDir().getPath().equals(
-          HddsVolumeUtil.getHddsRoot(volume))) {
-        return true;
+  @Test
+  public void testVolumeInInconsistentState() throws Exception {
+    assertEquals(2, volumeSet.getVolumesList().size());
+
+    // Add a volume to VolumeSet
+    String volume3 = baseDir + "disk3";
+
+    // Create the root volume dir and create a sub-directory within it.
+    File newVolume = new File(volume3, HDDS_VOLUME_DIR);
+    System.out.println("new volume root: " + newVolume);
+    newVolume.mkdirs();
+    assertTrue("Failed to create new volume root", newVolume.exists());
+    File dataDir = new File(newVolume, "chunks");
+    dataDir.mkdirs();
+    assertTrue(dataDir.exists());
+
+    // The new volume is in an inconsistent state as the root dir is
+    // non-empty but the version file does not exist. Add Volume should
+    // return false.
+    boolean success = volumeSet.addVolume(volume3);
+
+    assertFalse(success);
+    assertEquals(2, volumeSet.getVolumesList().size());
+    assertTrue("AddVolume should fail for an inconsistent volume",
+        !checkVolumeExistsInVolumeSet(volume3));
+
+    // Delete volume3
+    File volume = new File(volume3);
+    FileUtils.deleteDirectory(volume);
+  }
+
+  @Test
+  public void testShutdown() throws Exception {
+    List<HddsVolume> volumesList = volumeSet.getVolumesList();
+
+    volumeSet.shutdown();
+
+    // Verify that the volumes are shutdown and the volumeUsage is set to null.
+    for (HddsVolume volume : volumesList) {
+      Assert.assertNull(volume.getVolumeInfo().getUsageForTesting());
+      try {
+        // getAvailable() should throw null pointer exception as usage is null.
+        volume.getAvailable();
+        fail("Volume shutdown failed.");
+      } catch (NullPointerException ex) {
+        // Do Nothing. Exception is expected.
       }
     }
-    return false;
+  }
+
+  @Test
+  public void testFailVolumes() throws  Exception{
+    VolumeSet volSet = null;
+    File readOnlyVolumePath = new File(baseDir);
+    //Set to readonly, so that this volume will be failed
+    readOnlyVolumePath.setReadOnly();
+    File volumePath = GenericTestUtils.getRandomizedTestDir();
+    OzoneConfiguration ozoneConfig = new OzoneConfiguration();
+    ozoneConfig.set(HDDS_DATANODE_DIR_KEY, readOnlyVolumePath.getAbsolutePath()
+        + "," + volumePath.getAbsolutePath());
+    volSet = new VolumeSet(UUID.randomUUID().toString(), ozoneConfig);
+    assertTrue(volSet.getFailedVolumesList().size() == 1);
+    assertEquals(readOnlyVolumePath, volSet.getFailedVolumesList().get(0)
+        .getHddsRootDir());
+
+    //Set back to writable
+    try {
+      readOnlyVolumePath.setWritable(true);
+    } finally {
+      FileUtil.fullyDelete(volumePath);
+    }
+
   }
 }

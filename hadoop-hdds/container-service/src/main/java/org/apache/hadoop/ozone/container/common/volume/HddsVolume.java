@@ -37,11 +37,24 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.util.Properties;
+import java.util.UUID;
 
 /**
  * HddsVolume represents volume in a datanode. {@link VolumeSet} maitains a
  * list of HddsVolumes, one for each volume in the Datanode.
  * {@link VolumeInfo} in encompassed by this class.
+ *
+ * The disk layout per volume is as follows:
+ * ../hdds/VERSION
+ * ../hdds/<<scmUuid>>/current/<<containerDir>>/<<containerID>>/metadata
+ * ../hdds/<<scmUuid>>/current/<<containerDir>>/<<containerID>>/<<dataDir>>
+ *
+ * Each hdds volume has its own VERSION file. The hdds volume will have one
+ * scmUuid directory for each SCM it is a part of (currently only one SCM is
+ * supported).
+ *
+ * During DN startup, if the VERSION file exists, we verify that the
+ * clusterID in the version file matches the clusterID from SCM.
  */
 public final class HddsVolume {
 
@@ -72,6 +85,7 @@ public final class HddsVolume {
 
     private String datanodeUuid;
     private String clusterID;
+    private boolean failedVolume = false;
 
     public Builder(String rootDirStr) {
       this.volumeRootStr = rootDirStr;
@@ -102,34 +116,47 @@ public final class HddsVolume {
       return this;
     }
 
+    // This is added just to create failed volume objects, which will be used
+    // to create failed HddsVolume objects in the case of any exceptions caused
+    // during creating HddsVolume object.
+    public Builder failedVolume(boolean failed) {
+      this.failedVolume = failed;
+      return this;
+    }
+
     public HddsVolume build() throws IOException {
       return new HddsVolume(this);
     }
   }
 
   private HddsVolume(Builder b) throws IOException {
-    Preconditions.checkNotNull(b.volumeRootStr,
-        "Volume root dir cannot be null");
-    Preconditions.checkNotNull(b.datanodeUuid, "DatanodeUUID cannot be null");
-    Preconditions.checkNotNull(b.conf, "Configuration cannot be null");
+    if (!b.failedVolume) {
+      StorageLocation location = StorageLocation.parse(b.volumeRootStr);
+      hddsRootDir = new File(location.getUri().getPath(), HDDS_VOLUME_DIR);
+      this.state = VolumeState.NOT_INITIALIZED;
+      this.clusterID = b.clusterID;
+      this.datanodeUuid = b.datanodeUuid;
+      this.volumeIOStats = new VolumeIOStats();
 
-    StorageLocation location = StorageLocation.parse(b.volumeRootStr);
-    hddsRootDir = new File(location.getUri().getPath(), HDDS_VOLUME_DIR);
-    this.state = VolumeState.NOT_INITIALIZED;
-    this.clusterID = b.clusterID;
-    this.datanodeUuid = b.datanodeUuid;
-    this.volumeIOStats = new VolumeIOStats();
+      VolumeInfo.Builder volumeBuilder =
+          new VolumeInfo.Builder(b.volumeRootStr, b.conf)
+              .storageType(b.storageType)
+              .configuredCapacity(b.configuredCapacity);
+      this.volumeInfo = volumeBuilder.build();
 
-    VolumeInfo.Builder volumeBuilder =
-        new VolumeInfo.Builder(b.volumeRootStr, b.conf)
-        .storageType(b.storageType)
-        .configuredCapacity(b.configuredCapacity);
-    this.volumeInfo = volumeBuilder.build();
+      LOG.info("Creating Volume: " + this.hddsRootDir + " of  storage type : " +
+          b.storageType + " and capacity : " + volumeInfo.getCapacity());
 
-    LOG.info("Creating Volume: " + this.hddsRootDir + " of  storage type : " +
-        b.storageType + " and capacity : " + volumeInfo.getCapacity());
-
-    initialize();
+      initialize();
+    } else {
+      // Builder is called with failedVolume set, so create a failed volume
+      // HddsVolumeObject.
+      hddsRootDir = new File(b.volumeRootStr);
+      volumeIOStats = null;
+      volumeInfo = null;
+      storageID = UUID.randomUUID().toString();
+      state = VolumeState.FAILED;
+    }
   }
 
   public VolumeInfo getVolumeInfo() {
@@ -162,6 +189,10 @@ public final class HddsVolume {
       readVersionFile();
       setState(VolumeState.NORMAL);
       break;
+    case INCONSISTENT:
+      // Volume Root is in an inconsistent state. Skip loading this volume.
+      throw new IOException("Volume is in an " + VolumeState.INCONSISTENT +
+          " state. Skipped loading volume: " + hddsRootDir.getPath());
     default:
       throw new IOException("Unrecognized initial state : " +
           intialVolumeState + "of volume : " + hddsRootDir);
@@ -170,11 +201,23 @@ public final class HddsVolume {
 
   private VolumeState analyzeVolumeState() {
     if (!hddsRootDir.exists()) {
+      // Volume Root does not exist.
       return VolumeState.NON_EXISTENT;
     }
-    if (!getVersionFile().exists()) {
+    if (!hddsRootDir.isDirectory()) {
+      // Volume Root exists but is not a directory.
+      return VolumeState.INCONSISTENT;
+    }
+    File[] files = hddsRootDir.listFiles();
+    if (files == null || files.length == 0) {
+      // Volume Root exists and is empty.
       return VolumeState.NOT_FORMATTED;
     }
+    if (!getVersionFile().exists()) {
+      // Volume Root is non empty but VERSION file does not exist.
+      return VolumeState.INCONSISTENT;
+    }
+    // Volume Root and VERSION file exist.
     return VolumeState.NOT_INITIALIZED;
   }
 
@@ -262,7 +305,10 @@ public final class HddsVolume {
   }
 
   public StorageType getStorageType() {
-    return volumeInfo.getStorageType();
+    if(volumeInfo != null) {
+      return volumeInfo.getStorageType();
+    }
+    return StorageType.DEFAULT;
   }
 
   public String getStorageID() {
@@ -290,11 +336,17 @@ public final class HddsVolume {
   }
 
   public long getCapacity() throws IOException {
-    return volumeInfo.getCapacity();
+    if(volumeInfo != null) {
+      return volumeInfo.getCapacity();
+    }
+    return 0;
   }
 
   public long getAvailable() throws IOException {
-    return volumeInfo.getAvailable();
+    if(volumeInfo != null) {
+      return volumeInfo.getAvailable();
+    }
+    return 0;
   }
 
   public void setState(VolumeState state) {
@@ -311,21 +363,35 @@ public final class HddsVolume {
 
   public void failVolume() {
     setState(VolumeState.FAILED);
-    volumeInfo.shutdownUsageThread();
+    if (volumeInfo != null) {
+      volumeInfo.shutdownUsageThread();
+    }
   }
 
   public void shutdown() {
     this.state = VolumeState.NON_EXISTENT;
-    volumeInfo.shutdownUsageThread();
+    if (volumeInfo != null) {
+      volumeInfo.shutdownUsageThread();
+    }
   }
 
   /**
    * VolumeState represents the different states a HddsVolume can be in.
+   * NORMAL          => Volume can be used for storage
+   * FAILED          => Volume has failed due and can no longer be used for
+   *                    storing containers.
+   * NON_EXISTENT    => Volume Root dir does not exist
+   * INCONSISTENT    => Volume Root dir is not empty but VERSION file is
+   *                    missing or Volume Root dir is not a directory
+   * NOT_FORMATTED   => Volume Root exists but not formatted (no VERSION file)
+   * NOT_INITIALIZED => VERSION file exists but has not been verified for
+   *                    correctness.
    */
   public enum VolumeState {
     NORMAL,
     FAILED,
     NON_EXISTENT,
+    INCONSISTENT,
     NOT_FORMATTED,
     NOT_INITIALIZED
   }
@@ -335,8 +401,8 @@ public final class HddsVolume {
    */
   @VisibleForTesting
   public void setScmUsageForTesting(GetSpaceUsed scmUsageForTest) {
-    volumeInfo.setScmUsageForTesting(scmUsageForTest);
+    if (volumeInfo != null) {
+      volumeInfo.setScmUsageForTesting(scmUsageForTest);
+    }
   }
-
-
 }

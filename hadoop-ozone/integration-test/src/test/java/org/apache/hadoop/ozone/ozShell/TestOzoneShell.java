@@ -71,6 +71,7 @@ import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.ToolRunner;
 import org.junit.After;
 import org.junit.AfterClass;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Rule;
@@ -248,6 +249,8 @@ public class TestOzoneShell {
     String[] args = new String[] {"-deleteVolume", url + "/" + volumeName,
         "-root"};
     assertEquals(0, ToolRunner.run(shell, args));
+    String output = out.toString();
+    assertTrue(output.contains("Volume " + volumeName + " is deleted"));
 
     // verify if volume has been deleted
     try {
@@ -332,7 +335,7 @@ public class TestOzoneShell {
   public void testListVolume() throws Exception {
     LOG.info("Running testListVolume");
     String protocol = clientProtocol.getName().toLowerCase();
-    String commandOutput;
+    String commandOutput, commandError;
     List<VolumeInfo> volumes;
     final int volCount = 20;
     final String user1 = "test-user-a-" + protocol;
@@ -361,8 +364,15 @@ public class TestOzoneShell {
       assertNotNull(vol);
     }
 
+    String[] args = new String[] {"-listVolume", url + "/abcde", "-user",
+        user1, "-length", "100"};
+    assertEquals(1, ToolRunner.run(shell, args));
+    commandError = err.toString();
+    Assert.assertTrue(commandError.contains("Invalid URI:"));
+
+    err.reset();
     // test -length option
-    String[] args = new String[] {"-listVolume", url + "/", "-user",
+    args = new String[] {"-listVolume", url + "/", "-user",
         user1, "-length", "100"};
     assertEquals(0, ToolRunner.run(shell, args));
     commandOutput = out.toString();
@@ -701,6 +711,18 @@ public class TestOzoneShell {
     assertEquals(0, ToolRunner.run(shell, args));
 
     byte[] dataBytes = new byte[dataStr.length()];
+    try (FileInputStream randFile = new FileInputStream(new File(tmpPath))) {
+      randFile.read(dataBytes);
+    }
+    assertEquals(dataStr, DFSUtil.bytes2String(dataBytes));
+
+    tmpPath = baseDir.getAbsolutePath() + File.separatorChar + keyName;
+    args = new String[] {"-getKey",
+        url + "/" + volumeName + "/" + bucketName + "/" + keyName, "-file",
+        baseDir.getAbsolutePath()};
+    assertEquals(0, ToolRunner.run(shell, args));
+
+    dataBytes = new byte[dataStr.length()];
     try (FileInputStream randFile = new FileInputStream(new File(tmpPath))) {
       randFile.read(dataBytes);
     }
